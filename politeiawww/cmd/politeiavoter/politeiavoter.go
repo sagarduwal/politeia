@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	crand "crypto/rand"
 	"crypto/tls"
@@ -23,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/decred/dcrd/blockchain/stake"
@@ -140,14 +142,22 @@ func verifyMessage(address, message, signature string) (bool, error) {
 }
 
 type ctx struct {
+	sync.RWMutex            // retryQ lock
+	retryQ       *list.List // retry message queue FIFO
+	retryWG      sync.WaitGroup
+
+	c chan struct{} // close channel
+
+	cfg *config // application config
+
+	// https
 	client    *http.Client
-	cfg       *config
 	id        *identity.PublicIdentity
 	csrf      string
 	userAgent string
 
 	// wallet grpc
-	ctx    context.Context
+	wctx   context.Context
 	creds  credentials.TransportCredentials
 	conn   *grpc.ClientConn
 	wallet pb.WalletServiceClient
@@ -186,7 +196,8 @@ func newClient(cfg *config) (*ctx, error) {
 
 	// return context
 	return &ctx{
-		ctx:    context.Background(),
+		retryQ: new(list.List),
+		wctx:   context.Background(),
 		creds:  creds,
 		conn:   conn,
 		wallet: wallet,
@@ -437,7 +448,7 @@ func (c *ctx) inventory() error {
 	}
 
 	// Get latest block
-	ar, err := c.wallet.Accounts(c.ctx, &pb.AccountsRequest{})
+	ar, err := c.wallet.Accounts(c.wctx, &pb.AccountsRequest{})
 	if err != nil {
 		return err
 	}
@@ -480,7 +491,7 @@ func (c *ctx) inventory() error {
 				v.StartVote.Vote.Token, err)
 			continue
 		}
-		ctres, err := c.wallet.CommittedTickets(c.ctx,
+		ctres, err := c.wallet.CommittedTickets(c.wctx,
 			&pb.CommittedTicketsRequest{
 				Tickets: tix,
 			})
@@ -787,7 +798,7 @@ func (c *ctx) _vote(seed int64, token, voteId string) ([]string, *v1.BallotReply
 		return nil, nil, fmt.Errorf("ticket pool corrupt: %v %v",
 			token, err)
 	}
-	ctres, err := c.wallet.CommittedTickets(c.ctx,
+	ctres, err := c.wallet.CommittedTickets(c.wctx,
 		&pb.CommittedTicketsRequest{
 			Tickets: tix,
 		})
@@ -842,7 +853,7 @@ func (c *ctx) _vote(seed int64, token, voteId string) ([]string, *v1.BallotReply
 			Message: msg,
 		})
 	}
-	smr, err := c.wallet.SignMessages(c.ctx, sm)
+	smr, err := c.wallet.SignMessages(c.wctx, sm)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1117,7 +1128,7 @@ func _main() error {
 	defer c.conn.Close()
 
 	// Get block height to validate GRPC creds
-	ar, err := c.wallet.Accounts(c.ctx, &pb.AccountsRequest{})
+	ar, err := c.wallet.Accounts(c.wctx, &pb.AccountsRequest{})
 	if err != nil {
 		return err
 	}
